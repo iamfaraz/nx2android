@@ -8,6 +8,7 @@ Whether the port plays, on which device and game version, and what was checked. 
 
 | Game | Title ID | Status |
 |---|---|---|
+| Good Job! | `0100B0500FE4E000` | **boots** on a Samsung Galaxy S26 Ultra (SM-S948U1, Snapdragon 8 Elite Gen 5, Adreno 840, Android 17), base game 1.0.0 from a cartridge dump: the office lobby at a held 30 fps with audio; not played further yet. Its SDK 9.3.1 `sdk` build takes the node-area and alignment cuts (`sdk_patches.py`) |
 | Graveyard Keeper 2 | `0100005027A18000` | playable on the Legion Y700, update 1.0.4: the opening at a held 30 fps (as on the Switch) |
 | Hades II | `0100A00019DE0000` | playable on the Legion Y700, update 1.0 (v655360): the title, a new save, the Crossroads and runs in Erebus with combat, at a held 60 fps (as on the Switch) |
 | NEO: The World Ends with You | `010043B013C5C000` | playable on a Lenovo Legion Y700 (Snapdragon 8 Elite, Adreno 830), update 1.03 |

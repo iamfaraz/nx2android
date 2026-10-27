@@ -113,7 +113,7 @@ DEC_BINDING, DEC_SET, DEC_BLOCK, DEC_BUFFER_BLOCK, DEC_NONWRITABLE = 33, 34, 2, 
 SC_UNIFORM_CONSTANT, SC_UNIFORM, SC_STORAGE_BUFFER = 0, 2, 12
 def spirv_bindings(spv):
     w = struct.unpack(f'<{len(spv) // 4}I', spv)
-    names, deco, types, consts, vars_ = {}, collections.defaultdict(dict), {}, {}, []
+    names, deco, types, consts, vars_, extents = {}, collections.defaultdict(dict), {}, {}, [], {}   # extents: variable id → largest constant vec4 index read, None = an index is not a constant
     i = 5
     while i < len(w):
         n, op = w[i] >> 16, w[i] & 0xffff; ins = w[i:i + n]
@@ -128,6 +128,10 @@ def spirv_bindings(spv):
         elif op == OP_TYPE_STRUCT: types[ins[1]] = ('struct',)
         elif op == OP_CONSTANT and n == 4: consts[ins[2]] = ins[3]
         elif op == OP_VARIABLE: vars_.append((ins[2], ins[1], ins[3]))   # id, pointer type, storage class
+        elif op in (65, 66) and n >= 6:   # OpAccessChain / OpInBoundsAccessChain base, member index, array index: the constant buffers' reads (block { vec4 data[]; })
+            base, arr = ins[3], ins[5]
+            if base not in extents or extents[base] is not None: extents[base] = None if arr not in consts or extents.get(base, 0) is None else max(extents.get(base, 0), consts[arr])
+        elif op in (65, 66): extents[ins[3]] = None   # a pointer to the whole array (passed on): every index possible
         i += n
     out = []
     for vid, pt, sc in vars_:
@@ -145,7 +149,8 @@ def spirv_bindings(spv):
         else: dt = '?'
         img = t if t and t[0] == 'image' else types.get(t[1]) if t and t[0] == 'sampled' else None
         out.append({'name': names.get(vid, ''), 'set': d.get(DEC_SET, 0), 'binding': d[DEC_BINDING], 'type': dt, 'count': count,
-                    'dim': img[1] if img else None, 'arrayed': img[3] if img else 0, 'ms': img[4] if img else 0, 'fmt': img[5] if img else 0})
+                    'dim': img[1] if img else None, 'arrayed': img[3] if img else 0, 'ms': img[4] if img else 0, 'fmt': img[5] if img else 0,
+                    'extent': 16 * (extents[vid] + 1) if sc == SC_UNIFORM and vid in extents and extents[vid] is not None else None})   # bytes a constant buffer's reads stay within (every index a constant); None = unknown
     local = None
     i = 5
     scalars = {}   # type id → ('f' | 'i' | 'u')
@@ -178,7 +183,9 @@ def classify(stage, b, res):
     m = re.fullmatch(r'[a-z]+_c(\d+)', nm)
     if m:
         n = int(m.group(1))
-        e.update(kind='cbuf', reg=n - 3) if 3 <= n <= 16 else e.update(kind='c1' if n == 1 else 'drvcb', bank=n); return e
+        if 3 <= n <= 16: e.update(kind='cbuf', reg=n - 3, off=b.get('extent'))   # off: the bytes the shader reads of it (spirv_bindings extent), the backend's uniform shadows copy no more
+        else: e.update(kind='c1' if n == 1 else 'drvcb', bank=n)
+        return e
     if nm == 'support_buffer': e.update(kind='support'); return e
     m = re.fullmatch(r'[a-z]+_s(\d+)', nm)
     if m:

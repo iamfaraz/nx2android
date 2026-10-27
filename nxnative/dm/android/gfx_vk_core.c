@@ -146,8 +146,12 @@ void vk_pipeline_cache_save(void) {
 }
 
 // ---------------- memory pools ----------------
-#define MAXPOOL 4096
-static vkpool_t g_pool[MAXPOOL]; static int g_npool;
+// The table is kept sorted by address and searched by bisection: every uniform and storage binding of every draw looks its pool up (vk_buf_at, vk_pool_of, twice per
+// binding), and Breath of the Wild keeps about 4,000 pools alive (4,006 on an iPhone, upstream's note): a linear scan cost 12 to 14 ms a frame of its 3,200 draws on the
+// Adreno 840's phone and ended with "too many memory pools" at 4,096 (two crashes a few minutes into the field). Pointers from vk_pool_of are used at once, never kept
+#define MAXPOOL 65536
+static vkpool_t g_pool[MAXPOOL]; static int g_npool; uint64_t g_pool_nested;   // lookups the bisection missed (nested pools), found by the scan
+static int pool_lower(uint64_t lo) { int a = 0, b = g_npool; while (a < b) { int m = (a + b) / 2; if (g_pool[m].lo < lo) a = m + 1; else b = m; } return a; }   // first slot with lo >= the address
 static pthread_rwlock_t g_pool_mu = PTHREAD_RWLOCK_INITIALIZER;
 static int recv_fds(int sock, int *fds, int max) {
     char data[4096], ctl[CMSG_SPACE(sizeof(int) * 16)]; struct iovec iov = {data, sizeof data};
@@ -219,7 +223,8 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     if (!size) return;
     pthread_rwlock_wrlock(&g_pool_mu);
     if (g_npool == MAXPOOL) { pthread_rwlock_unlock(&g_pool_mu); die("[vk] too many memory pools"); }
-    vkpool_t *p = &g_pool[g_npool]; memset(p, 0, sizeof *p);
+    int at = pool_lower((uint64_t)(uintptr_t)mem); memmove(&g_pool[at + 1], &g_pool[at], sizeof *g_pool * (size_t)(g_npool - at));
+    vkpool_t *p = &g_pool[at]; memset(p, 0, sizeof *p);
     p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; { static uint64_t ser; p->serial = ++ser; }
     int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : pool_zero_copy(p, (uint8_t *)mem, size);
     if (zc) {
@@ -239,8 +244,9 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 void mtl_pool_del(const void *mem) {
     pthread_rwlock_wrlock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].lo == (uint64_t)(uintptr_t)mem) {
-        vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool];
+    int i = pool_lower((uint64_t)(uintptr_t)mem);
+    if (i < g_npool && g_pool[i].lo == (uint64_t)(uintptr_t)mem) {
+        vkpool_t p = g_pool[i]; memmove(&g_pool[i], &g_pool[i + 1], sizeof *g_pool * (size_t)(g_npool - i - 1)); g_npool--;
         pthread_rwlock_unlock(&g_pool_mu);
         if (p.zero_copy) pool_copy_back(&p);
         vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference
@@ -252,7 +258,13 @@ void mtl_pool_del(const void *mem) {
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) {
     vkpool_t *r = NULL;
     pthread_rwlock_rdlock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if (addr >= g_pool[i].lo && addr + len <= g_pool[i].hi) { r = &g_pool[i]; break; }
+    static int linear = -1; if (linear < 0) { const char *e = getenv("DM_VK_POOL_LINEAR"); linear = e && atoi(e); }   // DM_VK_POOL_LINEAR=1 (start-up): the old scan, first pool containing the range (A/B)
+    if (linear) { for (int i = 0; i < g_npool; i++) if (addr >= g_pool[i].lo && addr + len <= g_pool[i].hi) { r = &g_pool[i]; break; } }
+    else { int i = pool_lower(addr + 1) - 1;   // the last pool starting at or below addr: the one, when pools do not overlap
+        if (i >= 0 && addr >= g_pool[i].lo && addr + len <= g_pool[i].hi) r = &g_pool[i];
+        else {   // a pool inside another (its bytes past the inner one belong to the outer, which bisection cannot see): the scan, as before; counted for the replay line
+            for (int j = 0; j < g_npool; j++) if (addr >= g_pool[j].lo && addr + len <= g_pool[j].hi) { r = &g_pool[j]; break; }
+            if (r) { static int n; if (n++ < 4) VKLOG("memory pool lookup %#llx +%llu: inside a pool nested in another (%#llx +%#llx), found by the scan", (unsigned long long)addr, (unsigned long long)len, (unsigned long long)r->lo, (unsigned long long)(r->hi - r->lo)); g_pool_nested++; } } }
     pthread_rwlock_unlock(&g_pool_mu);
     return r;
 }

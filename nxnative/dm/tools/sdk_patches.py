@@ -135,4 +135,14 @@ CUTS = {
     (0x1423fc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x142468, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # SDK 9.3.1 sdk ad3fdfbd62a5 (Good Job! 1.0.0, Unity 2018.4.14f1): the node area cut and the 1 GB alignment cut, as Super Smash Bros. Ultimate's SDK 8.2.1 build above (the orr form), whose
+  # AddressRegionManager this is at other offsets. nninitStartup (main+0x1ac7190) calls StandardAllocator::Initialize(nullptr, pool − used) with virtual address memory (the NPDM declares a 16 MB
+  # system resource), which aborted at its CentralHeap::Init (sdk+0xc6530): the 1 GB-aligned region of about 3.1 GB did not fit the 4.375 GB alias region after the 1 GB node area. The constructor
+  # is at sdk+0xd2230 (the limit at +0xd2240 from orr w8,wzr,#0x3fe00000, the occupied length at +0xd22dc from orr w9,wzr,#0x3fe00000); VammManager::AllocateAddressRegion's helper (sdk+0xd23d0)
+  # aligns a region by its size, 1 GB for regions of 1 GB and more (+0xd243c). Found on the Mac host, then on Android (the same abort without the cuts)
+  'ad3fdfbd62a5f4b082d385ffe420d440': [
+    (0xd2240, 'e8230b32', '087ca052', 'AddressRegionManager constructor: node area limit orr w8,wzr,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0xd22dc, 'e9230b32', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0xd243c, 'ea030232', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more orr w10,wzr,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+  ],
 }

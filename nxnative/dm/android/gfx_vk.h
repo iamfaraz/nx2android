@@ -87,7 +87,7 @@ struct vkimg {
     uint32_t w, h, d, layers, levels, samples; int target, nvn_format;
     VkImageLayout layout;           // version 1 keeps every image in GENERAL after its first use
     int packaged;                   // filled from guest memory (deswizzled upload), re-uploaded when its pages change
-    uint64_t pkg_stamp; const void *pkg_span; uint64_t pkg_seen;
+    uint64_t pkg_stamp; const void *pkg_span; uint64_t pkg_seen; uint64_t pkg_frame;   // the present of its last upload (DM_VK_PKG_REFRESH)
     const uint8_t *pkg_mem; size_t pkg_len; uint64_t pkg_used; int pkg_released;   // its storage, the present it was last drawn at, protection given up (vk_tex_sweep)
     uint64_t used;                  // the present it was last looked up at (vk_tex: evict_overlaps)
     uint64_t fdz_frame;             // depth images: 1 + the present at which a fragment shader that replaces depth last wrote it (gfx_vk_exec.c fdz)

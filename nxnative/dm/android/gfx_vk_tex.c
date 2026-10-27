@@ -161,6 +161,7 @@ void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
     im->layout = VK_IMAGE_LAYOUT_GENERAL;
 }
 // Upload a packaged texture from guest memory: each level and layer deswizzled into scratch memory, copied in by the upload command buffer
+extern uint64_t g_tex_frame;   // presents so far (declared again below with the sweep)
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
@@ -177,7 +178,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     VkCommandBuffer cb = vk_upload_cmd();
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
     nvn_dirty_protect(t->mem, t->L.size);
-    im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
+    im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp; im->pkg_frame = g_tex_frame;
     im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0;
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
@@ -268,7 +269,10 @@ vkimg_t *vk_tex(const tex_t *t) {
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
         else {
             uint64_t now = nvn_dirty_now();
-            if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) pkg_upload(im, t, f);   // pages written since the upload
+            // DM_VK_PKG_REFRESH=N (live, a test): a packaged texture drawn N or more presents after its last upload is uploaded again whatever the dirty-page tracker saw.
+            // Breath of the Wild's streamed terrain tiles and colour tables went stale on the S26 Ultra with the tracker reporting no write-protection fault at all
+            static int refresh = -1; { const char *e = getenv("DM_VK_PKG_REFRESH"); int v = e ? atoi(e) : 0; if (v != refresh) { refresh = v; VKLOG("packaged textures: %s", v ? "uploaded again when drawn after N presents (DM_VK_PKG_REFRESH)" : "uploaded again only when their pages were written"); } }
+            if ((now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) || (refresh > 0 && g_tex_frame - im->pkg_frame >= (uint64_t)refresh)) pkg_upload(im, t, f);   // pages written since the upload
             im->pkg_seen = now;
         }
     } else if (fresh) vk_tex_prepare(vk_upload_cmd(), im);

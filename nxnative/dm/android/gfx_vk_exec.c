@@ -27,6 +27,7 @@ static struct {
     int sref[2], smask[2], swmask[2];
     p_poly_offset pofs; float blendc[4]; int depth_clamp, rast_discard, prim_restart;
     tex_t rt_col[8], rt_dep; view_t rt_cview[8], rt_dview; uint8_t rt_has_col[8], rt_has_cview[8], rt_has_dep, rt_has_dview; int rt_n; uint32_t rt_bad[8];   // rt_bad: the first word of a colour slot that is not a texture object (traces)
+    uint8_t rt_dup[8];   // the slot repeats an earlier slot's image, level and layer: left unattached (begin_pass)
     int64_t row_stride, image_stride;
     // the open render pass
     int pass_open; uint32_t pass_w, pass_h; VkFormat cfmt[8], dfmt; VkImageAspectFlags daspect; uint32_t samples; int ncol;
@@ -68,7 +69,8 @@ uint64_t vk_replay_ns(void) { return g_vkst.ns_exec; }   // the replay time so f
 // flicker experiments (DM_CTL env lines, read every submission): DM_VK_X_NOSETC no descriptor set reuse, DM_VK_X_NODRVC no driver segment reuse, DM_VK_X_LANDCUT deferred
 // uniform updates land at each cut, DM_VK_X_NOKEEP no pass kept for the same targets, DM_VK_X_NOSHC no shadow reuse
 static int g_fdz = 1;  // DM_VK_FDZ (live): fragment-depth variants for draws on depth written by fragment shaders (pipeline key fdz)
-static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt; int g_x_noshc;   // g_xfb_on: DM_VK_XFB=0 captures no transform feedback (A/B)
+static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt; int g_x_noshc;
+static int g_bar_game, g_pass_swrite, g_ub_extent = 1, g_fb_split, g_fb_hit;   // DM_VK_FB_SPLIT=1 (live, off by default): a draw that samples an attachment of the open pass ends the pass first (g_fb_hit: this draw does)   // DM_VK_BAR_GAME=1 (live): a game barrier keeps the open pass unless a draw of it bound a storage image or buffer (OP_BARRIER; off by default); g_pass_swrite: a draw of the open pass bound one; DM_VK_UB_EXTENT=0 (live): uniform bindings keep the game's bound range instead of the shader's read extent (A/B)
 static char g_x_tracesize[40], g_x_traceframe[40]; static int g_x_traceframe_on;
 // DM_VK_WATCH=<pool offset, hex>[#n] (live): log the next n (20) uses of images at that offset of their pool (attachment, sampled, copy), with the pass and present
 // numbers, to find what fills a texture a pass reads
@@ -98,8 +100,11 @@ static long long g_td_off = -1; static unsigned long long g_td_pool; static vkim
 void vk_texdump_note(vkimg_t *im) { if (g_td_off >= 0 && !g_td_done && !g_td_im && im && im->off == g_td_off && im->pool == g_td_pool) g_td_im = im; }
 void vk_watch(const vkimg_t *im, const char *what) {
     if (g_watch_off < 0 || !im || im->off != g_watch_off || g_watch_n <= 0) return;
-    g_watch_n--; VKLOG("watch: present %llu pass %d (%ux%u): %s %ux%u fmt %d pool %#llx+%#llx", (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, what, im->w, im->h, im->fmt,
-                       (unsigned long long)im->pool, (unsigned long long)im->off);
+    int nvn_dirty_tracked(const void *addr, size_t len); int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp); uint64_t nvn_dirty_now(void);
+    g_watch_n--; VKLOG("watch: present %llu pass %d (%ux%u): %s %ux%u fmt %d pool %#llx+%#llx; packaged %d released %d mem %p+%zu tracked %d written-since-upload %d clock %llu/%llu uploaded at present %llu",
+                       (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, what, im->w, im->h, im->fmt, (unsigned long long)im->pool, (unsigned long long)im->off,
+                       im->packaged, im->pkg_released, (const void *)im->pkg_mem, im->pkg_len, im->pkg_mem ? nvn_dirty_tracked(im->pkg_mem, im->pkg_len) : -1,
+                       im->pkg_mem ? nvn_dirty_since_span(im->pkg_span, im->pkg_mem, im->pkg_len, im->pkg_stamp) : -1, (unsigned long long)nvn_dirty_now(), (unsigned long long)im->pkg_seen, (unsigned long long)im->pkg_frame);
 }
 static void x_read(void) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws = c ? atoi(c) : 128; g_sub_pass = 0;
     const char *fy = getenv("DM_VK_FLIPY"); g_flipy = !(fy && !atoi(fy));   // on unless DM_VK_FLIPY=0
@@ -116,7 +121,7 @@ static void x_read(void) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws
     { const char *tz = getenv("DM_VK_TRACE_SIZE"); snprintf(g_x_tracesize, sizeof g_x_tracesize, "%s", tz ? tz : ""); } const char *e; g_x_nobar = (e = getenv("DM_VK_X_NOBAR")) && atoi(e); g_x_depth = (e = getenv("DM_VK_X_DEPTH")) && atoi(e); g_x_color = (e = getenv("DM_VK_X_COLOR")) && atoi(e);
     g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e); g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e);
-    g_lrz_touch = !((e = getenv("DM_VK_LRZ_TOUCH")) && !atoi(e)); g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e)); }
+    g_bar_game = (e = getenv("DM_VK_BAR_GAME")) && atoi(e); g_fb_split = (e = getenv("DM_VK_FB_SPLIT")) && atoi(e); g_ub_extent = !((e = getenv("DM_VK_UB_EXTENT")) && !atoi(e)); g_lrz_touch = !((e = getenv("DM_VK_LRZ_TOUCH")) && !atoi(e)); g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e)); }
 void vk_exec_reset(void) {   // a new submission: NVN state does not carry over between command buffers, the replay starts from the defaults
     static int inited; if (!inited) { inited = 1; state_reset(); prewarm_start(); }
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_set_epoch++; x_read();
@@ -177,7 +182,7 @@ static VkFramebuffer fb_get(const fbkey *k) {
     pthread_mutex_unlock(&g_rp_mu); return fb;
 }
 // the attachments begin_pass found, for the render pass begin: each colour slot's (and the depth's) image, view, view format and layers, size at the view's level
-static struct { vkimg_t *im; VkImageView v; uint32_t fmt, layers, w, h; } P_att[9];
+static struct { vkimg_t *im; VkImageView v; uint32_t fmt, layers, w, h, lv, ly; } P_att[9];
 
 // Before a pass that goes on with a depth-stencil buffer (loads it), one texel of its depth is copied out: a transfer read makes Adreno's driver drop the
 // buffer's low-resolution depth (LRZ), which it otherwise kept from earlier passes even within one command buffer. NEO's menu → field wipe drew whole 32x32
@@ -404,7 +409,7 @@ void vk_end_pass(void) {
     if (S.pass_open == 2 && P_cleared) pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1) crumb_mark(0);
-    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
+    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0; g_pass_swrite = 0;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
@@ -420,15 +425,24 @@ static int begin_pass(void) {
     for (int i = 0; i < S.rt_n; i++) {
         S.cfmt[i] = VK_FORMAT_UNDEFINED;
         ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO; ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL; ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        S.rt_dup[i] = 0;
         if (!S.rt_has_col[i]) continue;
         vkimg_t *im; VkImageView v = vk_tex_view(&S.rt_col[i], S.rt_has_cview[i] ? &S.rt_cview[i] : NULL, 0xff, 0, 1, &im);
         if (!v) continue;
+        uint32_t lv = S.rt_has_cview[i] && S.rt_cview[i].set_levels ? S.rt_cview[i].base_level : 0, ly = S.rt_has_cview[i] && S.rt_cview[i].set_layers ? S.rt_cview[i].min_layer : 0;
+        // The same image, level and layer at more than one colour slot: only the first is attached (as nvn_mtl.m rt_dup_slot). The G-buffer passes of The Legend of Zelda:
+        // Breath of the Wild attach the albedo and the normals twice each (c1 = c2, c3 = c4) with the channel masks of c2 / c4 always 0: the Switch's ROP writes only the
+        // masked channels and the two slots do not interfere, while a tiler keeps a tile copy per attachment and stores both back at the end of the pass, so the copy that
+        // was loaded and never written overwrote the other's writes, tile by tile in no fixed order: on the Adreno 840 the albedo and normals came out black (the lit
+        // scene black but for emissive effects, Link a dark silhouette, surfaces showing for single frames as the camera moved). A draw that really writes such a slot is
+        // reported once (pipeline_get): those writes are dropped
+        for (int j = 0; j < i; j++) if (P_att[j].im == im && P_att[j].lv == lv && P_att[j].ly == ly) { S.rt_dup[i] = 1; break; }
+        if (S.rt_dup[i]) continue;
         vk_tex_prepare(cb, im);
-        uint32_t lv = S.rt_has_cview[i] && S.rt_cview[i].set_levels ? S.rt_cview[i].base_level : 0;
         uint32_t iw = im->w >> lv ? im->w >> lv : 1, ih = im->h >> lv ? im->h >> lv : 1;
         if (iw < w) w = iw; if (ih < h) h = ih; samples = im->samples; have = 1;
         ca[i].imageView = v; S.cfmt[i] = vk_view_fmt; ncol = i + 1; P_att[i].im = im;   // (the view's format: a render pass's attachment and its pipelines take it)
-        P_att[i].fmt = vk_view_fmt; P_att[i].layers = vk_view_layers ? vk_view_layers : 1; P_att[i].w = iw; P_att[i].h = ih;
+        P_att[i].fmt = vk_view_fmt; P_att[i].layers = vk_view_layers ? vk_view_layers : 1; P_att[i].w = iw; P_att[i].h = ih; P_att[i].lv = lv; P_att[i].ly = ly;
     }
     S.dfmt = VK_FORMAT_UNDEFINED; S.daspect = 0;
     if (S.rt_has_dep) {
@@ -752,19 +766,26 @@ static int view_num(const tex_t *t, const view_t *v) {
 }
 static uint64_t g_num_um, g_num_im;   // stage_set: the sampled bindings of the stage being built that got uint / int views (bit = binding index)
 extern uint64_t g_tex_gen;
+// A draw that samples an attachment of the open pass reads what the pass's earlier draws wrote only once the pass has stored it: on the Switch the game puts an
+// INVALIDATE_TEXTURE barrier before such reads and the texture unit then reads memory; a tiler's attachment lives in tile memory until the pass ends. Breath of the Wild's
+// terrain detail draws sample the G-buffer's albedo and normal targets while drawing into them (the pass of 1,900 draws): without the split the ground lost its detail
+// texture and its height, Link walking on a smooth tan plane. Tried as the cause: the pass ended before such a draw (prepare_draw) and begun again with the same targets,
+// loaded. It fired for every draw of that pass (360,000 splits in a few minutes) and the terrain stayed flat, so it is off by default (DM_VK_FB_SPLIT=1 tries it); the
+// terrain's data path is still open (its material arrays are intact and never written; its vertex streams are the next suspect)
+static void fb_note(const vkimg_t *im) { if (!im || !g_fb_split || !S.pass_open) return; for (int i = 0; i < S.ncol; i++) if (P_att[i].im == im) { g_fb_hit = 1; return; } if (P_att[8].im == im) g_fb_hit = 1; }
 static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, int storage) {   // the view's view_num
     int tid = (int)(h & 0xfffff); const view_t *v = NULL; const tex_t *t = NULL;
     ii->imageLayout = VK_IMAGE_LAYOUT_GENERAL; ii->sampler = storage ? VK_NULL_HANDLE : samp_for(st, b, h); ii->imageView = VK_NULL_HANDLE;
     unsigned ck = ((unsigned)tid * 2654435761u ^ (unsigned)b->dim * 97u ^ (unsigned)(b->flags & 1)) % TVC;
     if (tid && g_var_now != 3 && !g_tracing && g_tvc[ck].epoch == g_set_epoch && g_tvc[ck].gen == g_tex_gen && g_tvc[ck].tid == tid && g_tvc[ck].dim == b->dim && g_tvc[ck].arr == (b->flags & 1)) {
-        ii->imageView = g_tvc[ck].v; if (g_tvc[ck].im) g_tvc[ck].im->last_use = mtl_last_fence() + 1; vk_texdump_note(g_tvc[ck].im); return g_tvc[ck].num;
+        ii->imageView = g_tvc[ck].v; if (g_tvc[ck].im) { g_tvc[ck].im->last_use = mtl_last_fence() + 1; fb_note(g_tvc[ck].im); } vk_texdump_note(g_tvc[ck].im); return g_tvc[ck].num;
     }
     int num = 0;
     if (tid && g_var_now != 3 && vk_tex_by_id(tid, &v, &t) && t) {
         vkimg_t *im = NULL; ii->imageView = vk_tex_view(t, v, b->dim, b->flags & 1, 0, &im); if (storage && im) im->gpu_w = 1;
         if (g_tracing) VKLOG("  texture handle %#llx id %d: %ux%u nvn format %#x target %d serial %llu pool %p+%#llx size %#llx → image %p (%ux%u fmt %d layers %u levels %u) view %p", (unsigned long long)h, tid, t->d.width, t->d.height, t->d.format, t->d.target,
                              (unsigned long long)t->serial, (const void *)t->pool, (unsigned long long)t->off, (unsigned long long)t->L.size, (void *)im, im ? im->w : 0, im ? im->h : 0, im ? im->fmt : 0, im ? im->layers : 0, im ? im->levels : 0, (void *)ii->imageView);
-        if (im) im->last_use = mtl_last_fence() + 1;
+        if (im) { im->last_use = mtl_last_fence() + 1; fb_note(im); }
         if (ii->imageView) num = view_num(t, v);
         if (ii->imageView) { g_tvc[ck].epoch = g_set_epoch; g_tvc[ck].gen = g_tex_gen; g_tvc[ck].tid = tid; g_tvc[ck].dim = b->dim; g_tvc[ck].arr = b->flags & 1; g_tvc[ck].v = ii->imageView; g_tvc[ck].im = im; g_tvc[ck].num = num; }
     }
@@ -811,6 +832,10 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
         case RK_CBUF: {
             const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
             uint64_t n = u && u->size ? (u->size > 65536 ? 65536 : u->size) : 65536;
+            // The shader reads at most b->off bytes of this constant buffer (shader_vk.py: every index into it a constant; -1 = unknown): the binding stops there, so a
+            // shadow of a buffer with deferred updates copies that much instead of the game's bound range. Breath of the Wild binds 64 KB blocks its shaders read a few
+            // hundred bytes of (vp_c3 176, fp_c7 624) and updates them before most draws: 17 MB of shadow copies a frame, with about 120 shadows
+            if (g_ub_extent && b->off > 0 && (uint64_t)b->off < n) n = (uint64_t)b->off;
             if (g_var_now == 9) { bi[nw] = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536}; break; }
             if (u && u->addr && vk_buf_at(u->addr, 1, &buf, &off)) {
                 vkpool_t *p = vk_pool_of(u->addr, 1); if (off + n > p->hi - p->lo) n = p->hi - p->lo - off;
@@ -823,6 +848,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
         case RK_DRV: { VkBuffer sb; VkDeviceSize so; drv_shared(st, b->reg, &sb, &so); bi[nw] = (VkDescriptorBufferInfo){sb, so, 0x1000}; break; }
         case RK_SBUF: case RK_UBO_PTR: case RK_SBUF_UBO: {
             uint64_t a = 0, n = 0;
+            if (st < 5 && b->kind != RK_UBO_PTR) g_pass_swrite = 1;   // a storage buffer a draw may write (OP_BARRIER)
             if (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16) { a = S.ssbo[st][b->reg].addr; n = S.ssbo[st][b->reg].size; }
             else if (b->kind == RK_UBO_PTR && b->reg >= 0 && b->reg < 16) { a = S.ubo[st][b->reg].addr; n = S.ubo[st][b->reg].size; }
             else if (b->kind == RK_SBUF_UBO) { a = (uint64_t)ubo_word(st, b->reg, b->off) | (uint64_t)ubo_word(st, b->reg, b->off + 4) << 32; }
@@ -845,6 +871,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
             wr->pImageInfo = &ii[nii]; nii += (uint32_t)cnt; wr->descriptorCount = (uint32_t)cnt; wr->descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; nw++;
             continue; }
         case RK_IMG: case RK_IMG_UBO: {
+            if (st < 5) g_pass_swrite = 1;   // a storage image a draw may write (OP_BARRIER)
             uint64_t h = b->kind == RK_IMG ? (b->reg >= 0 && b->reg < 32 ? S.img[st][b->reg] : 0) : ubo_word(st, b->reg, b->off);
             tex_desc_for(st, b, h, &ii[nii], 1); wr->pImageInfo = &ii[nii++]; wr->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; nw++;
             continue; }
@@ -1007,6 +1034,7 @@ static int prepare_draw(int prim, int indexed) {
     for (int i = 0; i < S.ncol; i++) {
         k.cfmt[i] = S.cfmt[i];
         k.wmask[i] = S.cfmt[i] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;
+        if (S.rt_dup[i] && ((S.chmask.mask >> (4 * i)) & 0xf)) VKRED_ONCE(32, "colour slot %d holds the same image, level and layer as an earlier slot and is written (channel mask %#x): its writes are dropped (begin_pass)", i, (S.chmask.mask >> (4 * i)) & 0xf);
         const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
         if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
             k.blend_en |= 1u << i;
@@ -1025,6 +1053,10 @@ static int prepare_draw(int prim, int indexed) {
     uint64_t t1d = tnow();
     for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { sets[S.sh[st]->set] = stage_set(st, S.sh[st], dofs[S.sh[st]->set]); k.um[st] = g_num_um; k.im[st] = g_num_im; }
     uint64_t tdesc = tnow() - t1d; g_vkst.ns_desc += tdesc;
+    if (g_fb_hit) {   // this draw samples an attachment of the open pass (fb_note): the pass ends and begins again, so the read sees what was drawn before it
+        g_fb_hit = 0; static uint64_t n; n++; if (n <= 3 || n % 10000 == 0) VKLOG("pass split before a draw that samples one of its attachments (%llu so far; %ux%u, shaders %016llx %016llx)", (unsigned long long)n, S.pass_w, S.pass_h, (unsigned long long)(S.sh[0] ? S.sh[0]->key : 0), (unsigned long long)(S.sh[1] ? S.sh[1]->key : 0));
+        vk_end_pass(); vk_img_barrier_all(vk_cmd()); if (!begin_pass()) { g_vkst.skip_rt++; return 0; } pass_commit(); cb = vk_cmd();   // (the pass was committed above, before the sets: the new one must be too)
+    }
     if (g_tracing) {
         VKLOG("  pipeline: topology %u restart %u discard %u cull %u front %u mode %u clamp %u bias %u; depth test %u write %u func %u stencil %u; attributes %u bindings %u; colour %u (format %u) samples %u a2c %u; blend enable %#x logic %u/%u; fragment depth variant %u (depth written by a shader at present %llu, now %llu)",
               k.topo, k.restart, k.raster_discard, k.cull, k.front, k.mode, k.depth_clamp, k.bias_en, k.dt, k.dw, k.df, k.st, k.nattr, k.nbind, k.ncol, k.cfmt[0], k.samples, k.a2c, k.blend_en, k.logic_en, k.logic_op,
@@ -1484,9 +1516,19 @@ static void exec_ops(const uint8_t *p) {
         case OP_DRAW: { p_draw t; draw(draw_rec(a, h.size, &t)); break; }
         case OP_DRAW_IDX: { p_draw_idx t; draw_idx(draw_idx_rec(a, h.size, &t)); break; }
         case OP_DISPATCH: dispatch((const p_dispatch *)a); break;
-        case OP_BARRIER:   // the pass ends at every barrier: kept across XC3's fragment- and primitive-order barriers (0x1 0x2 0x4) its characters drew torn in some frames
-            if (g_x_listpasses) VKLOG("    barrier %#x", *(const int32_t *)a);
-            vk_end_pass(); vk_img_barrier_all(vk_cmd()); break;
+        case OP_BARRIER: {   // A game barrier orders what comes next behind the pass, not the draws inside it: the pass stays open, and the next pass, copy or dispatch
+            // begins behind the full barrier anyway (begin_pass, vk_end_pass_land). It ends the pass only when a draw of the pass bound a storage image or buffer
+            // (g_pass_swrite, as nvn_mtl.m swrite_note): Vulkan orders nothing between a pass's draws for shader writes, and kept across Xenoblade Chronicles 3's
+            // fragment- and primitive-order barriers (0x1 0x2 0x4) its characters drew torn in some frames. Breath of the Wild issues ORDER_FRAGMENTS | INVALIDATE_SHADER
+            // (0x12) between its draw groups, 131 times a frame: ending the pass at each one made about 120 passes a frame of 3,200 draws, and on the Adreno 840 the GPU
+            // took 44 ms a frame whatever the render scale (the same 44 ms at 0.5). Kept open, though, Breath of the Wild's terrain lost its height and material textures in
+            // places (Link sank into flat green ground): its barriers are ORDER_FRAGMENTS | INVALIDATE_TEXTURE, after which it samples what the open pass drew. And its GPU
+            // time did not depend on the pass count (the kgsl busy counter said 55%: the host's replay was the limit). So the old rule is the default; DM_VK_BAR_GAME=1 (live) keeps the passes
+            int32_t bits = *(const int32_t *)a; int order = bits & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT);
+            int keep = g_bar_game && S.pass_open && !(order && g_pass_swrite);
+            if (g_x_listpasses) VKLOG("    barrier %#x%s", bits, keep ? " (the pass stays open)" : "");
+            if (!keep) { vk_end_pass(); vk_img_barrier_all(vk_cmd()); }
+            break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;   // the handles were rebased when recorded (hle_nvn.c bind_handles)
         case OP_COPY_STRIDE: { const p_copy_stride *c = (const p_copy_stride *)a; if (c->image) S.image_stride = c->stride; else S.row_stride = c->stride; break; }
         case OP_COPY_B2T: copy_b2t((const p_copy_b2t *)a, 1); break;

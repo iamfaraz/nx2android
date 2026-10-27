@@ -1,0 +1,10 @@
+# Good Job! on Android (keys in docs/ARCHITECTURE.md "Game profiles on Android")
+# Unity 2018.4.14f1 on SDK 9.3.1; game.tsv started as upstream's provisional profile and was checked by hand. Its sdk build (ad3fdfbd62a5) needs the AddressRegionManager
+# node-area and 1 GB-alignment cuts in dm/tools/sdk_patches.py: without them StandardAllocator::Initialize(nullptr, pool - used) in nninitStartup aborts before nnMain.
+# On a Samsung Galaxy S26 Ultra (SM-S948U1, Snapdragon 8 Elite Gen 5, Adreno 840, Android 17; 2026-10-27), base game 1.0.0 (v0, cartridge dump): boots into the office
+# lobby and holds 30 fps (frame p95 34 ms over 800 frames), audio playing; red lines: one audio callback stall at start (the silent sink stood in), one draw with no usable
+# render target. Not played past the lobby yet.
+status	boots
+tested	v0 Samsung Galaxy S26 Ultra SM-S948U1 (Snapdragon 8 Elite Gen 5, Adreno 840, Android 17)
+package	org.nx2a.goodjob
+orientation	landscape
