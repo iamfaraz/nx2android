@@ -4,6 +4,8 @@
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
 #include "../../host/dm.h"
+#include "../../host/dm_uc.h"
+#include <ucontext.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -92,8 +94,25 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     }
 }
 static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t *count);
+// Read trap (a diagnostic, DM_VK_TRAP_READS in gfx_vk_tex.c): a span made inaccessible so that the game's CPU reads of it are counted, with the first program counters;
+// each faulting page is made readable and writable again (the dirty tracker no longer sees writes to it)
+enum { TRAP_PCS = 12 };
+static struct { _Atomic uintptr_t base, end; _Atomic uint64_t reads, writes; _Atomic uint64_t pc[TRAP_PCS]; _Atomic int npc; } g_trap;
+void nvn_dirty_trap_reads(const void *mem, size_t len) {
+    uintptr_t b = (uintptr_t)mem & ~(g_pg - 1), e = ((uintptr_t)mem + len + g_pg - 1) & ~(g_pg - 1);
+    atomic_store(&g_trap.base, b); atomic_store(&g_trap.end, e); mprotect((void *)b, e - b, PROT_NONE);
+}
+int nvn_dirty_trap_stats(uint64_t *reads, uint64_t *writes, uint64_t *pcs, int max) {
+    *reads = atomic_load(&g_trap.reads); *writes = atomic_load(&g_trap.writes); int n = atomic_load(&g_trap.npc); if (n > TRAP_PCS) n = TRAP_PCS; if (n > max) n = max;
+    for (int i = 0; i < n; i++) pcs[i] = atomic_load(&g_trap.pc[i]); return n;
+}
 static int on_fault(void *addr, int is_write, void *uc) {
-    (void)uc;
+    { uintptr_t a = (uintptr_t)addr, b = atomic_load(&g_trap.base), e = atomic_load(&g_trap.end);
+      if (b && a >= b && a < e) {
+          mprotect((void *)(a & ~(g_pg - 1)), g_pg, PROT_READ | PROT_WRITE);
+          atomic_fetch_add(is_write ? &g_trap.writes : &g_trap.reads, 1);
+          int k = atomic_fetch_add(&g_trap.npc, 1); if (k < TRAP_PCS) atomic_store(&g_trap.pc[k], (uint64_t)DM_UC_SS((ucontext_t *)uc)->__pc);
+          return 1; } }
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++) {   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
@@ -234,6 +253,13 @@ void nvn_dirty_remove_range(const void *mem) {
     for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
     if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
     pthread_mutex_unlock(&g_slot_mu);
+}
+// Diagnostics (gfx_vk_exec.c vk_watch): the state (0 none, 1 protected, 2 busy) and write generation of the page holding addr in the first live range covering it; -1 = untracked
+int nvn_dirty_page_info(const void *addr, int *state, uint64_t *gen) {
+    uintptr_t a = (uintptr_t)addr; int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (!live_at(i) || a < r->base || a >= r->end) continue;
+        uintptr_t p = (a - r->base) >> g_shift; *state = atomic_load(&r->state[p]); *gen = atomic_load(&r->gen[p]); return i; }
+    return -1;
 }
 int nvn_dirty_tracked(const void *addr, size_t len) {
     return find_span((uintptr_t)addr, len) != NULL;

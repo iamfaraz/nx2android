@@ -91,6 +91,8 @@ struct vkimg {
     const uint8_t *pkg_mem; size_t pkg_len; uint64_t pkg_used; int pkg_released;   // its storage, the present it was last drawn at, protection given up (vk_tex_sweep)
     uint64_t used;                  // the present it was last looked up at (vk_tex: evict_overlaps)
     uint64_t fdz_frame;             // depth images: 1 + the present at which a fragment shader that replaces depth last wrote it (gfx_vk_exec.c fdz)
+    int cpu_filled;                 // classified as CPU-filled without a packaged layout (gfx_vk_tex.c cpu_filled_tex) at some use: stays so, whatever the flush list says later
+    int gpu_w_by; uint64_t gpu_w_at;   // (watch) what first set gpu_w: 1 storage image, 2 buffer → texture copy, 3 texture copy, 4 clear, 5 attachment; and the present
     int gpu_w;                      // the GPU wrote it: an attachment, a storage image, a copy or clear destination (gfx_vk_exec.c); lin_copy keeps that until the CPU writes its storage
     uint64_t lin_stamp; const void *lin_span; const uint8_t *lin_mem; size_t lin_len;   // lin_copy: the storage watched since the GPU wrote it
     uint64_t lin_gen;               // linear textures: the upload command buffer (g_up_gen) that last copied it from its pool (vk_tex: lin_copy)

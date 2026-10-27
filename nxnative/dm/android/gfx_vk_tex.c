@@ -198,6 +198,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     }
 }
 static int packaged_tex(const tex_t *t);
+static int cpu_filled_tex(const tex_t *t, const vkfmt_t *f);
 static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static void vk_tex_view_drop_all(vkimg_t *im);
 // Images over the same memory with different descriptions (the storage key differs) are separate Vulkan images: on the Switch a texture sees what another
@@ -264,7 +265,10 @@ vkimg_t *vk_tex(const tex_t *t) {
     pthread_mutex_unlock(&g_img_mu);
     if (!vk_sub_open()) return fresh ? NULL : im;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
     if (t->mem && lin_copy(im, t, f)) {}
-    else if (t->mem && packaged_tex(t)) {
+    else if (t->mem && (packaged_tex(t) || im->cpu_filled || (!im->gpu_w && cpu_filled_tex(t, f)))) {
+        // The classification is sticky: Breath of the Wild's terrain tile caches (an R16 heightmap array, RGBA8 index maps) were uploaded at their first use, then never
+        // looked at again once a later use no longer met cpu_filled_tex, so the sweep released their protection and the tiles the game wrote stayed the first upload's
+        if (!packaged_tex(t)) im->cpu_filled = 1;
         im->pkg_used = g_tex_frame;
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
         else {
@@ -289,6 +293,10 @@ typedef struct { uint64_t used; vkimg_t *im; } pkg_age;
 static int pkg_age_cmp(const void *a, const void *b) { uint64_t x = ((const pkg_age *)a)->used, y = ((const pkg_age *)b)->used; return x < y ? -1 : x > y; }
 void vk_tex_sweep(void) {
     if (++g_tex_frame % 300) return;
+    { int nvn_dirty_trap_stats(uint64_t *reads, uint64_t *writes, uint64_t *pcs, int max); module_t *module_of(const void *p); static uint64_t last; uint64_t rd, wr, pcs[12]; int n = nvn_dirty_trap_stats(&rd, &wr, pcs, 12);
+      if (rd + wr != last) { last = rd + wr; char b[512]; int o = 0; for (int i = 0; i < n && o < 400; i++) { module_t *m = module_of((void *)(uintptr_t)pcs[i]);
+            o += m ? snprintf(b + o, sizeof b - o, " %s+%#llx", m->name, (unsigned long long)(pcs[i] - (uint64_t)(uintptr_t)m->base)) : snprintf(b + o, sizeof b - o, " %#llx", (unsigned long long)pcs[i]); }
+          VKLOG("read trap: %llu CPU reads and %llu writes of the trapped storage so far; first faults at%s", (unsigned long long)rd, (unsigned long long)wr, b); } }
     uint64_t idle = 0, lru = 0, before = nvn_dirty_released();
     pthread_mutex_lock(&g_img_mu);
     pkg_age *v = NULL; size_t nv = 0, cap = 0;
@@ -339,8 +347,11 @@ void mtl_tex_cpu_written(const tex_t *t) { if (!t->serial) return; pthread_mutex
 // into linear planes: as GPU-only images of zeros all text, the title art and the movies were blank. A Vulkan image cannot be bound to the pool's memory (a dedicated
 // AHardwareBuffer import, bound to its buffer), so each upload command buffer that a submission's draws need it in copies it from the pool buffer on the GPU (lin_copy).
 // The packaged path (CPU upload, re-upload on written pages) is the fallback; as the only path the page faults of the CPU's writes cost Hades II about 120 a frame and
-// 2 million while loading. Not LINEAR_RENDER_TARGET: the GPU draws into those, and a copy from storage would replace what it drew
-static int linear_tex(const tex_t *t) { return t->pool && (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) == NVN_TEXTURE_FLAGS_LINEAR; }
+// 2 million while loading. LINEAR_RENDER_TARGET textures are linear too: the GPU may draw into them, which lin_copy's gpu_w rule covers (the image keeps what the GPU
+// drew until the CPU writes the storage again). Breath of the Wild streams its terrain through 256x256 R16 and RGBA8 textures with LINEAR_RENDER_TARGET alone (no LINEAR
+// bit): the CPU decompresses each tile into one, flushes it, and a draw copies it into a layer of the tile caches. Left out of every upload path they were images of zeros,
+// and the caches, the terrain's height and material maps, were filled from them: the ground drew flat, at one height, without detail
+static int linear_tex(const tex_t *t) { return t->pool && (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0; }
 extern uint64_t g_up_gen;
 static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = the image holds its storage as of this upload buffer
     if (!linear_tex(t) || im->levels != 1 || im->d != 1 || im->layers != 1 || f->bw > 1 || f->bh > 1 || !f->bpb || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
@@ -358,6 +369,20 @@ static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = th
     VkBufferImageCopy r = {o, (uint32_t)(stride / f->bpb), 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
     vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     return 1;
+}
+// A texture the CPU fills in place, with no packaged layout and no WriteTexels: in a pool the CPU can write, storage the game flushed (nvnMemoryPoolFlushMappedRange,
+// nvn_flushed in hle_nvn.c) or a CPU_UNCACHED pool, whose writes reach memory with no flush, holds the texture's content at its first use, and the game writes new content
+// there later (nvn_mtl.m's rule, which fills such a texture from its storage; Breath of the Wild's sky scattering tables there). Here it is treated as packaged: uploaded
+// from its storage at first use and again when its pages change, unless the GPU has written the image (vk_tex). Breath of the Wild streams its terrain through such
+// textures: 8-layer tile caches of heights (1024x1024 R16), material indices (512x512 RGBA8) and a 256x256 table, each in a pool of its own, read by the terrain's vertex
+// and fragment shaders. As GPU-only images of zeros the ground drew as one flat colour per tile, without height (Link sank into it) and without detail. Left out, as in
+// nvn_mtl.m: render targets and images (COMPRESSIBLE, IMAGE), linear ones (lin_copy), multisample, depth and stencil, buffer textures, pools the CPU cannot read
+static int cpu_filled_tex(const tex_t *t, const vkfmt_t *f) {
+    int nvn_flushed(const void *p, uint64_t n);
+    if (!t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || t->d.samples > 1 || (f && (f->depth || f->stencil))) return 0;
+    if (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) return 0;
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE)) return 0;
+    return (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) || nvn_flushed(t->mem, t->L.size);
 }
 static int packaged_tex(const tex_t *t) {
     if (t->has_layout || linear_tex(t)) return 1;
@@ -397,8 +422,14 @@ __thread VkFormat vk_view_fmt; __thread uint32_t vk_view_layers;
 VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, int as_attachment, vkimg_t **img_out) {
     vkimg_t *im = vk_tex(t); if (img_out) *img_out = im;
     if (!im) return VK_NULL_HANDLE;
-    if (as_attachment) { im->wseq = ++g_wseq; im->gpu_w = 1; } else if (im->novl) alias_check(im);
-    vk_watch(im, as_attachment ? "attachment" : "sampled or image");
+    if (as_attachment) { im->wseq = ++g_wseq; if (!im->gpu_w) { im->gpu_w_by = 5; im->gpu_w_at = g_tex_frame; } im->gpu_w = 1;
+        // DM_VK_TRAP_READS=<pool hex>+<offset hex> (start-up, a diagnostic): once that image has been drawn into, its storage is made inaccessible to the CPU and the game's
+        // reads of it are counted with their program counters (vk_tex_sweep prints them): does the game read back what the GPU rendered (unified memory on the Switch)?
+        static int armed = -1; static unsigned long long tp; static long long to;
+        if (armed < 0) { const char *e = getenv("DM_VK_TRAP_READS"); armed = 0; if (e) { const char *pl = strchr(e, '+'); tp = strtoull(e, NULL, 16); to = pl ? strtoll(pl + 1, NULL, 16) : 0; armed = 1; } }
+        if (armed == 1 && im->pool == tp && im->off == to && t->mem) { void nvn_dirty_trap_reads(const void *mem, size_t len); nvn_dirty_trap_reads(t->mem, t->L.size); armed = 2; VKLOG("read trap armed on %p +%llu (pool %#llx+%#llx)", (const void *)t->mem, (unsigned long long)t->L.size, tp, (unsigned long long)to); }
+    } else if (im->novl) alias_check(im);
+    if (!as_attachment) vk_watch(im, "sampled or image");   // (attachments: begin_pass reports the slot, level and layer)
     if (!as_attachment) { void vk_texdump_note(vkimg_t *im); vk_texdump_note(im); }
     const vkfmt_t *f = vk_fmt(vw && vw->set_format ? vw->format : t->d.format); if (!f) f = vk_fmt(t->d.format);
     uint32_t lv0 = vw && vw->set_levels ? vw->base_level : 0, nlv = vw && vw->set_levels ? vw->nlevels : im->levels - lv0;
@@ -476,6 +507,9 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     pthread_mutex_lock(&g_rmu);
     if (tid >= g_ntreg) { int n = tid + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     g_tex_gen++; treg_t *r = &g_treg[tid];
+    { static int wid = -2; if (wid == -2) { const char *e = getenv("DM_VK_WATCH_ID"); wid = e ? atoi(e) : -1; }   // DM_VK_WATCH_ID=<texture ID>: every registration of that ID is logged (start-up switch)
+      if (tid == wid) { static int n; if (n++ < 200) VKLOG("watch: texture ID %d registered at present %llu: %s%ux%ux%u nvn format %#x target %d levels %u flags %#x serial %llu pool %p+%#llx size %#llx%s", tid, (unsigned long long)g_tex_frame, t ? "" : "nothing (",
+            t ? t->d.width : 0, t ? t->d.height : 0, t ? t->d.depth : 0, t ? t->d.format : 0, t ? t->d.target : 0, t ? t->d.levels : 0, t ? t->d.flags : 0, t ? (unsigned long long)t->serial : 0ull, t ? (const void *)t->pool : NULL, t ? (unsigned long long)t->off : 0ull, t ? (unsigned long long)t->L.size : 0ull, t ? "" : ")"); } }
     if (r->cur.ok && seq) {   // keep the one replaced for the jobs queued before this registration
         if (!r->old) r->old = calloc(TREG_OLD, sizeof *r->old);
         if (r->old) { memmove(r->old + 1, r->old, sizeof *r->old * (TREG_OLD - 1)); r->old[0] = r->cur; }
